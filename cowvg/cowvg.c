@@ -14,9 +14,16 @@ typedef struct {
     unsigned char a;
 } CowColor;
 
+typedef enum {
+    COW_PATH_TYPE_NORMAL = 0,
+    COW_PATH_TYPE_INTERIOR_EDGE = 1,
+    COW_PATH_TYPE_EXTERIOR_EDGE = 2,
+} CowPathType;
+
 typedef struct {
     float *points;
     int point_counts;
+    CowPathType type;
 } CowPath;
 
 typedef struct {
@@ -31,6 +38,30 @@ typedef struct {
 typedef struct {
     float x, y;
 } CowPoint;
+
+static inline int line_line_intersection(CowPoint p1, CowPoint p2, CowPoint p3, CowPoint p4, CowPoint *inter) {
+    float x1 = p1.x, y1 = p1.y;
+    float x2 = p2.x, y2 = p2.y;
+    float x3 = p3.x, y3 = p3.y;
+    float x4 = p4.x, y4 = p4.y;
+
+    // Calculate the determinant
+    float determinant = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+
+    // Check if lines are parallel
+    if (fabs(determinant) < 0.0001f) {
+        return 0;  // No intersection
+    } else {
+        // Calculate the intersection point
+        float x = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / determinant;
+        float y = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / determinant;
+
+        // Store the intersection point
+        inter->x = x;
+        inter->y = y;
+        return 1;  // Intersection found
+    }
+}
 
 static inline int is_point_inside_edge(CowPoint point, CowPoint vertex1, CowPoint vertex2) {
     return ((vertex1.y > point.y) != (vertex2.y > point.y)) &&
@@ -153,6 +184,7 @@ static CowShape *priv_cow_make_lines_from_svg(CowSvg svg) {
 
         for (NSVGpath *path = shape->paths; path != NULL; path = path->next) {
             CowPath current_path = {0};
+            current_path.type = COW_PATH_TYPE_NORMAL;
             lastPos = (CowPoint) {path->pts[0], path->pts[1]};
             priv_cow_add_line_to_path(&current_path, lastPos.x, lastPos.y);
             for (int i = 0; i < path->npts - 1; i += 3) {
@@ -244,6 +276,8 @@ static void priv_cow_apply_transform(CowShape *shape, float translate_x, float t
 
 static int priv_cow_scanline_sub_pixel(CowShape *current_shape, CowPoint pixel) {
     int sub_hit = 0;
+    int interior_hit = 0;
+    int external_hit = 0;
     //for every path
     for (int i = 0; i < current_shape->path_counts; ++i) {
         CowPath *current_path = &current_shape->paths[i];
@@ -252,6 +286,11 @@ static int priv_cow_scanline_sub_pixel(CowShape *current_shape, CowPoint pixel) 
         for (int j = 1; j < points_count; j += 1) {
             if (is_point_inside_edge(pixel, points[j - 1], points[j])) {
                 ++sub_hit;
+                if (current_path->type == COW_PATH_TYPE_INTERIOR_EDGE) {
+                    ++interior_hit;
+                } else if (current_path->type == COW_PATH_TYPE_EXTERIOR_EDGE) {
+                    ++external_hit;
+                }
             }
         }
 
@@ -260,7 +299,13 @@ static int priv_cow_scanline_sub_pixel(CowShape *current_shape, CowPoint pixel) 
         }
     }
 
-    return sub_hit;
+    //it detects that it's inside
+    if (sub_hit % 2 != 0) {
+
+        return 1;
+    }
+
+    return 0;
 }
 
 static float priv_cow_scanline_pixel(CowShape *current_shape, int x, int y) {
@@ -275,7 +320,7 @@ static float priv_cow_scanline_pixel(CowShape *current_shape, int x, int y) {
             pixel.y += (float) (sub_y + 1) / (float) (subpixels + 1);
             int hit = priv_cow_scanline_sub_pixel(current_shape, pixel);
 
-            if (hit % 2 != 0) {
+            if (hit) {
                 ++sub_hit;
             }
         }
@@ -325,9 +370,10 @@ static CowPoint priv_compute_outline_point(CowPoint p1, CowPoint p2, CowPoint p3
     return point_add(p2, point_mul(miter, thickness));
 }
 
-static void priv_cow_outline_path(CowPath *base, CowPath *outline, float thickness) {
+static void priv_cow_outline_path(CowPath *base, CowPath *outline, float thickness, CowPathType path_type) {
     outline->point_counts = base->point_counts;
     outline->points = calloc(base->point_counts, sizeof(float));
+    outline->type = path_type;
     for (int j = 2; j < base->point_counts - 2; j += 2) {
         CowPoint p1 = (CowPoint) {base->points[j - 2], base->points[j - 1]};
         CowPoint p2 = (CowPoint) {base->points[j], base->points[j + 1]};
@@ -353,19 +399,28 @@ static void priv_cow_outline_path(CowPath *base, CowPath *outline, float thickne
 }
 
 static void priv_cow_outline_shape(CowShape *shape_to_outline) {
-    CowShape *new_shape = calloc(1, sizeof(CowShape));
-    new_shape->path_counts = shape_to_outline->path_counts * 2;
-    new_shape->paths = calloc(new_shape->path_counts, sizeof(CowPath));
-    new_shape->color = shape_to_outline->stroke_color;
+    CowShape *current_shape = shape_to_outline;
+    CowShape *last_shape = priv_cow_get_last_shape(shape_to_outline);
+    while (current_shape != NULL) {
+        CowShape *new_shape = calloc(1, sizeof(CowShape));
+        new_shape->path_counts = current_shape->path_counts * 2;
+        new_shape->paths = calloc(new_shape->path_counts, sizeof(CowPath));
+        new_shape->color = current_shape->stroke_color;
 
-    for (int i = 0; i < shape_to_outline->path_counts; ++i) {
-        priv_cow_outline_path(&shape_to_outline->paths[i], &new_shape->paths[i * 2],
-                              shape_to_outline->stroke / 2.f);
-        priv_cow_outline_path(&shape_to_outline->paths[i], &new_shape->paths[i * 2 + 1],
-                              -shape_to_outline->stroke / 2.f);
+        for (int i = 0; i < current_shape->path_counts; ++i) {
+            priv_cow_outline_path(&current_shape->paths[i], &new_shape->paths[i * 2],
+                                  current_shape->stroke / 2.f, COW_PATH_TYPE_EXTERIOR_EDGE);
+            priv_cow_outline_path(&current_shape->paths[i], &new_shape->paths[i * 2 + 1],
+                                  -current_shape->stroke / 2.f, COW_PATH_TYPE_INTERIOR_EDGE);
+        }
+
+        priv_cow_get_last_shape(shape_to_outline)->next = (struct CowShape *) new_shape;
+        if (current_shape == last_shape) {
+            current_shape = NULL;
+        } else {
+            current_shape = (CowShape *) current_shape->next;
+        }
     }
-
-    priv_cow_get_last_shape(shape_to_outline)->next = (struct CowShape *) new_shape;
 }
 
 void priv_cowvg_rasterize_shape(CowSurface *surface, CowShape *shape) {
